@@ -1,0 +1,8 @@
+# Generated build files
+/build/
+/out/
+
+# Local Visual Studio settings
+.vs/
+*.user
+CMakeUserPresets.json
