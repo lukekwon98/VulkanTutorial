@@ -14,7 +14,8 @@ import vulkan_hpp; //if C++20 modules is enabled, we import this instead
 #include <stdexcept>
 #include <cstdlib> 
 #include <algorithm>
-#include <map>
+#include <cstdint> //uint32_t
+#include <limits> //std::numeric_limits
 
 constexpr uint32_t WIDTH = 800; //calculates its value eduring compilation, speeds up runtime execution, unlike const for which initialization can still happen at runtime
 constexpr uint32_t HEIGHT = 600;
@@ -39,12 +40,12 @@ std::vector<const char*> getRequiredinstanceExtensions() {
 
 	std::vector extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
 
-	//validation layerse will print debu gmessages to standard output by default, but we can also handle them ourselves with an explicit callback -> allows you to decide which kind of messages you'd like to see
-	if (enableValidationLayers) {
-		extensions.push_back(vk::EXTDebugUtilsExtensionName); //extension that sets up debug messenger with a callback (equal to "VK_EXT_debug_utils" string)
-	}
+//validation layerse will print debu gmessages to standard output by default, but we can also handle them ourselves with an explicit callback -> allows you to decide which kind of messages you'd like to see
+if (enableValidationLayers) {
+	extensions.push_back(vk::EXTDebugUtilsExtensionName); //extension that sets up debug messenger with a callback (equal to "VK_EXT_debug_utils" string)
+}
 
-	return extensions;
+return extensions;
 }
 
 class HelloTriangleApplication {
@@ -71,7 +72,16 @@ private:
 
 	vk::raii::Device device = nullptr; //logical device
 
-	vk::raii::Queue graphicsQueue = nullptr; //interface to handle queues which are automatically created along with the logical device, implicitly cleaned up when the device is destroyed
+	vk::raii::Queue queue = nullptr; //interface to handle queues which are automatically created along with the logical device, implicitly cleaned up when the device is destroyed
+
+	//needs to be created using HWND and HMODULE on windows
+	vk::raii::SurfaceKHR surface = nullptr; //connects Vulkan to the native window system, and GLFW helps create that connection. platform-independent handle to the window's presentation destination, GLFW handles the platform specifid work of creating the surface for our window
+
+	//format and extent for the swap chain images stored as member vars
+	vk::raii::SwapchainKHR swapChain = nullptr;
+	std::vector<vk::Image> swapChainImages;
+	vk::SurfaceFormatKHR swapChainSurfaceFormat;
+	vk::Extent2D swapChainExtent;
 
 	void initWindow() {
 		//first call should be glfwInit() - initializes the GLFW library (it's originally designed to create an OpenGL context, so we need to tell it not to create an OpenGL context)
@@ -87,30 +97,133 @@ private:
 	void initVulkan() {
 		createInstance(); //initializing the vulkan library by creating an instance - it is the connection between the application and the vulkan library
 		setupDebugMessenger();
+		createSurface();
 		pickPhysicalDevice();
 		createLogicalDevice();
+		createSwapChain();
+	}
+
+	//resolution of the swap chain images, almost exactly equal to the resolution of the window we're drawing to,
+	//but some managers allow us to differ using max uint32_t -> we'll pick the resolution that best mathces the window within minImageExtent and maxImageExtent bounds
+	vk::Extent2D chooseSwapExtent(vk::SurfaceCapabilitiesKHR const& capabilities) {
+		//pixel size and screen coordinates may not be the same in cases like apple's retin adisplay (higher pixel density, resolution of the window inpixel is larger than screen coord resolution
+
+		//currentExtent is only set to the special undefined value when the window manager lets us chosoe the extent ourselves, any other value means the surface already dictates a fixed extent
+		if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
+			return capabilities.currentExtent;
+		}
+		int width, height;
+		glfwGetFramebufferSize(window, &width, &height); //query the resolution of the window in pixel
+
+		return { std::clamp<uint32_t>(width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
+				std::clamp<uint32_t>(height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height) };
+	}
+
+	vk::PresentModeKHR chooseSwapPresentMode(std::vector<vk::PresentModeKHR> const& availablePresentModes) {
+		//eMailbox (triple buffering) is the best if energy usage is not an issue (non-mobile)
+		assert(std::ranges::any_of(availablePresentModes, [](auto presentMode) { return presentMode == vk::PresentModeKHR::eFifo; }));
+		return std::ranges::any_of(availablePresentModes,
+			[](const vk::PresentModeKHR value) { return vk::PresentModeKHR::eMailbox == value; }) ? //if any supports eMailbox, then return eMailbox, if not default to eFifo
+			vk::PresentModeKHR::eMailbox :
+			vk::PresentModeKHR::eFifo;
+	}
+
+	//choosing the right settings for the best possible swap chain. considerations: 1. surface format (color depth) 2. presentaiton mode (conditions for swapping images to the screen) 3. swap extent (resolution of images in swapchain)
+	vk::SurfaceFormatKHR chooseSwapSurfaceFormat(std::vector<vk::SurfaceFormatKHR> const& availableFormats) {
+		//SurfaceFormatKHR contains .format(specifies the color channels and types) and .colorSpace(indicates if the sRGB color space is supported or not)
+		const auto formatIt = std::ranges::find_if(
+			availableFormats,
+			[](const auto& format) { return format.format == vk::Format::eB8G8R8A8Srgb && format.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear; }); //find one that supports common color format and srgb
+
+		return formatIt != availableFormats.end() ? *formatIt : availableFormats[0]; //if nothing exists, we can start ranking, but it's usually good enough to use the first one
+	}
+	
+	//simply sticking to the minimum means we have to sometimes wait for the driver to complete internal operations before acquiring another image to render to, in practice, it's common to request a few more images than the strict min
+	uint32_t chooseSwapMinImageCount(vk::SurfaceCapabilitiesKHR const& surfaceCapabilities) {
+		auto minImageCount = std::max(3u, surfaceCapabilities.minImageCount); //min image count is at least 3
+		if ((0 < surfaceCapabilities.maxImageCount) && (surfaceCapabilities.maxImageCount < minImageCount)){
+			minImageCount = surfaceCapabilities.maxImageCount;
+		}
+
+		return minImageCount;
+	}
+
+	void createSwapChain() {
+		//checking if a swap chain is available is not enough, it must also be compatible with our window surface
+		auto surfaceCapabilities = physicalDevice.getSurfaceCapabilitiesKHR(*surface); //1. basic surface capabilities (min/max number of images in swap chain, min/max width and height of images)
+		swapChainExtent = chooseSwapExtent(surfaceCapabilities);  //resolution
+		uint32_t minImageCount = chooseSwapMinImageCount(surfaceCapabilities); //number of images in swapchain
+
+		std::vector<vk::SurfaceFormatKHR> availableFormats = physicalDevice.getSurfaceFormatsKHR(*surface);
+		swapChainSurfaceFormat = chooseSwapSurfaceFormat(availableFormats);
+
+		std::vector<vk::PresentModeKHR> availablePresentModes = physicalDevice.getSurfacePresentModesKHR(*surface); //this doesn't require member func to store value?
+
+		//Structure to create a swap chain object
+		vk::SwapchainCreateInfoKHR swapChainCreateInfo{
+			.surface = *surface,
+			.minImageCount = minImageCount,
+			.imageFormat = swapChainSurfaceFormat.format,
+			.imageColorSpace = swapChainSurfaceFormat.colorSpace,
+			.imageExtent = swapChainExtent,
+			.imageArrayLayers = 1, //specifies the number of layers each image consists of, always 1 unless you're developing a stereoscopic 3D application
+			.imageUsage = vk::ImageUsageFlagBits::eColorAttachment, //specifies what operations we'll use the images for, we'll be rendering directly to them, different value for post processing
+			.imageSharingMode = vk::SharingMode::eExclusive, // an image is owned by one queue family at a time, ownership must be explicity transferred before using it in another family -> best performance <-> eConcurrent
+			.preTransform = surfaceCapabilities.currentTransform, // specify that a certain transform should be applied to images in the swap chain if it is supported (90 deg rotation or horizontal flip), currentTrans means no transformation
+			.compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque, //specifies if the alpha channel should be used for blending
+			.presentMode = chooseSwapPresentMode(availablePresentModes),
+			.clipped = true //if true we don't care about the color of pixels that are obscured(another window is in front of them)
+		};
+
+		swapChainCreateInfo.oldSwapchain = nullptr; //it's possible that our swap chain becomes invalid or unoptimized during runtime (resizing of window), and the swap chain has to be recreated from scratch, and a reference to the old one must be specified here
+	
+
+		swapChain = vk::raii::SwapchainKHR(device, swapChainCreateInfo); //logical device and swap chain creation info
+		swapChainImages = swapChain.getImages(); //retrieving the handles of the vk::Image objects that the swapchain contains
+	}
+
+	void createSurface() {
+		//KHR stands for Khronos
+		VkSurfaceKHR _surface; //GLFW only deals with the Vulkan C API, but it can be prompted to the C++ wrapper
+		if (glfwCreateWindowSurface(*instance, window, nullptr, &_surface) != 0) {
+			throw std::runtime_error("failed to create window surface!");
+		}
+		surface = vk::raii::SurfaceKHR(instance, _surface);
+
+		//not every device in the system may support window system integration -> we need to extend createLogicalDevice to ensure that a device can presnt images to the surface we created
+		//presentation is a queue-specific feature, so we must find a queue family that supports presenting to the surface and also graphics commands
 	}
 
 	void createLogicalDevice() {
 		//we checked for a graphics-capable queue family during physical-device selection
 		//now we request a queue from that family when creating the logical device
 		std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
-		auto graphicsQueueFamilyProperty = std::ranges::find_if(queueFamilyProperties, [](auto const& qfp) { return (qfp.queueFlags & vk::QueueFlagBits::eGraphics) != static_cast<vk::QueueFlags>(0); });
-		auto graphicsIndex = static_cast<uint32_t>(std::distance(queueFamilyProperties.begin(), graphicsQueueFamilyProperty));
+		
+		uint32_t queueIndex = ~0; //bitwise not, all bits are set to 1
+		for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); qfpIndex++) {
+			if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) && physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface)) { //also must be surface compatible
+				queueIndex = qfpIndex;
+				break;
+			}
+		}
+		if (queueIndex == ~0) {
+			throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
+		}
 
 		//Vulkan lets you assign prioriites to queues to influence the scheduling of the command buffer execution (0.0 - 1.0)
 		float queuePriority = 0.5f;
 		vk::DeviceQueueCreateInfo deviceQueueCreateInfo{ 
-			.queueFamilyIndex = graphicsIndex, 
+			.queueFamilyIndex = queueIndex, 
 			.queueCount = 1, 
 			.pQueuePriorities = &queuePriority }; //describes the number of queues we want for a single queue family
 
+		//query for vulkan 1.3 features
 		//Vulkan is backwards compatible (by default, we only have access to the basic features from Vulkan 1.0, to use newer features, we need to explicitly request them -> Structure Chaining to enable multiple sets of features
 		vk::StructureChain<vk::PhysicalDeviceFeatures2,
 			vk::PhysicalDeviceVulkan11Features,
 			vk::PhysicalDeviceVulkan13Features,
-			vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain = {
-				{},
+			vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain = { //for enabling each structs data while optionally enabling functionality controlled by feature switches
+				{}, //still gets basic functionality
 				{.shaderDrawParameters = true}, //using this feature from PhysicalDeviceVulkan11Features
 				{.dynamicRendering = true},
 				{.extendedDynamicState = true}
@@ -127,7 +240,7 @@ private:
 		};
 
 		device = vk::raii::Device(physicalDevice, deviceCreateInfo);
-		graphicsQueue = vk::raii::Queue(device, graphicsIndex, 0);
+		queue = vk::raii::Queue(device, queueIndex, 0);
 	}
 
 	bool isDeviceSuitable(vk::raii::PhysicalDevice const& physicalDevice) {
