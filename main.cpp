@@ -67,8 +67,11 @@ private:
 
 	vk::raii::PhysicalDevice physicalDevice = nullptr; //the graphics card that we'll select will be stored here
 
-	std::vector<const char*> requiredDeviceExtension = { vk::KHRSwapchainExtensionName };
+	std::vector<const char*> requiredDeviceExtension = { vk::KHRSwapchainExtensionName }; //list of required extensions for required extension check during physical device check, KHRSwapchain is needed to present rendered images to the window
 
+	vk::raii::Device device = nullptr; //logical device
+
+	vk::raii::Queue graphicsQueue = nullptr; //interface to handle queues which are automatically created along with the logical device, implicitly cleaned up when the device is destroyed
 
 	void initWindow() {
 		//first call should be glfwInit() - initializes the GLFW library (it's originally designed to create an OpenGL context, so we need to tell it not to create an OpenGL context)
@@ -82,9 +85,49 @@ private:
 	}
 
 	void initVulkan() {
-		createInstance(); //initializing the vulkan library by creating an instance - it is the connectino between the application and the vulkan library
+		createInstance(); //initializing the vulkan library by creating an instance - it is the connection between the application and the vulkan library
 		setupDebugMessenger();
 		pickPhysicalDevice();
+		createLogicalDevice();
+	}
+
+	void createLogicalDevice() {
+		//we checked for a graphics-capable queue family during physical-device selection
+		//now we request a queue from that family when creating the logical device
+		std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
+		auto graphicsQueueFamilyProperty = std::ranges::find_if(queueFamilyProperties, [](auto const& qfp) { return (qfp.queueFlags & vk::QueueFlagBits::eGraphics) != static_cast<vk::QueueFlags>(0); });
+		auto graphicsIndex = static_cast<uint32_t>(std::distance(queueFamilyProperties.begin(), graphicsQueueFamilyProperty));
+
+		//Vulkan lets you assign prioriites to queues to influence the scheduling of the command buffer execution (0.0 - 1.0)
+		float queuePriority = 0.5f;
+		vk::DeviceQueueCreateInfo deviceQueueCreateInfo{ 
+			.queueFamilyIndex = graphicsIndex, 
+			.queueCount = 1, 
+			.pQueuePriorities = &queuePriority }; //describes the number of queues we want for a single queue family
+
+		//Vulkan is backwards compatible (by default, we only have access to the basic features from Vulkan 1.0, to use newer features, we need to explicitly request them -> Structure Chaining to enable multiple sets of features
+		vk::StructureChain<vk::PhysicalDeviceFeatures2,
+			vk::PhysicalDeviceVulkan11Features,
+			vk::PhysicalDeviceVulkan13Features,
+			vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain = {
+				{},
+				{.shaderDrawParameters = true}, //using this feature from PhysicalDeviceVulkan11Features
+				{.dynamicRendering = true},
+				{.extendedDynamicState = true}
+		};
+
+		//requirements are similar because logical device interface has to be compatible with physical device
+		//logical devices don't interact directly with instances, which is why it's not included as a parameter
+		vk::DeviceCreateInfo deviceCreateInfo{
+			.pNext = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
+			.queueCreateInfoCount = 1,
+			.pQueueCreateInfos = &deviceQueueCreateInfo,
+			.enabledExtensionCount = static_cast<uint32_t>(requiredDeviceExtension.size()), //these extensions are device-specific unlike the extensions in vk::InstanceCreateInfo
+			.ppEnabledExtensionNames = requiredDeviceExtension.data()
+		};
+
+		device = vk::raii::Device(physicalDevice, deviceCreateInfo);
+		graphicsQueue = vk::raii::Queue(device, graphicsIndex, 0);
 	}
 
 	bool isDeviceSuitable(vk::raii::PhysicalDevice const& physicalDevice) {
@@ -246,40 +289,3 @@ int main() {
 
 	return EXIT_SUCCESS;
 }
-
-//Without Vulkan RAII
-//VkInstance instance;
-//VkApplicationInfo appInfo{};
-//appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-//appInfo.pApplicationName = "Hello Triangle";
-//appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-//appInfo.pEngineName = "No Engine";
-//appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-//appInfo.apiVersion = VK_API_VERSION_1_0;
-//
-//VkInstanceCreateInfo createInfo{};
-//createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-//createInfo.pApplicationInfo = &appInfo;
-//createInfo.enabledExtensionCount = 0;
-//createInfo.ppEnabledExtensionNames = nullptr;
-//createInfo.enabledLayerCount = 0;
-//createInfo.ppEnabledLayerNames = nullptr;
-//
-//if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
-//	throw std::runtime_error("failed to create instance!");
-//}
-//
-//vkDestroyInstance(instance, nullptr);
-
-//With Vulkan RAII
-//constexpr vk::ApplicationInfo appInfo{ .pApplicationName = "Hello Triangle",
-//									  .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
-//									  .pEngineName = "No Engine",
-//									  .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-//									  .apiVersion = vk::ApiVersion14 };
-//
-//vk::InstanceCreateInfo createInfo{
-//	.pApplicationInfo = &appInfo
-//};
-//
-//instance = vk::raii::Instance(context, createInfo);
