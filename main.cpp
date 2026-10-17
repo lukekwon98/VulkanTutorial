@@ -10,6 +10,10 @@ import vulkan_hpp; //if C++20 modules is enabled, we import this instead
 #define  GLFW_INCLUDE_VULKAN //Tells GLFW to include the Vulkan C API headers when the compiler processes it. GLFW_INCLUDE_NONE tells it not to include graphics API headers automatically
 #include <GLFW/glfw3.h>
 
+#include <cassert>
+#include <vector>
+#include <string>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <cstdlib> 
@@ -83,6 +87,8 @@ private:
 	vk::SurfaceFormatKHR swapChainSurfaceFormat;
 	vk::Extent2D swapChainExtent;
 
+	std::vector<vk::raii::ImageView> swapChainImageViews; //in order to use any image, we need to create a ImageView object: how to access the image and which part of the iamge to access
+
 	void initWindow() {
 		//first call should be glfwInit() - initializes the GLFW library (it's originally designed to create an OpenGL context, so we need to tell it not to create an OpenGL context)
 		glfwInit();
@@ -101,6 +107,29 @@ private:
 		pickPhysicalDevice();
 		createLogicalDevice();
 		createSwapChain();
+		createImageViews();
+	}
+
+	//viewType, format, subresourceRange are identical for each of the image views
+	void createImageViews() {
+		assert(swapChainImageViews.empty());
+
+		//max number of image views you should expect graphics cards to handle is 16, there are cases where thousands are needed, but that can also be handled
+
+		vk::ImageViewCreateInfo imageViewCreateInfo{
+			.viewType = vk::ImageViewType::e2D, //specify we're rendering on a 2d screen (3d for 3d screen or cube map, 1d screen option exists too)
+			.format = swapChainSurfaceFormat.format, //how the colorspace components are configured
+			.components = {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity}, // not necessary as this is just the default, but just to show 
+			.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1} //describes what the image's purpose is and which part of the image should be accessed, no mipmap, no multiple layers (can also initialize using .designatedinit = value)
+		};
+		//components field: allows us to swizzle the color chanels around (can map all the channels to the red channel for a monochrome texture, can also map constant values of 0 and 1) we will stick to default mapping
+		//you'd use multiple layers for a stereographic 3D application (subresourceRange)
+
+		//loop over all swap chain images and add them to our swapChainImageViews structure
+		for (auto& image : swapChainImages) {
+			imageViewCreateInfo.image = image;
+			swapChainImageViews.emplace_back(device, imageViewCreateInfo); //only update the image component and keep pushing
+		}
 	}
 
 	//resolution of the swap chain images, almost exactly equal to the resolution of the window we're drawing to,
@@ -223,7 +252,7 @@ private:
 			vk::PhysicalDeviceVulkan11Features,
 			vk::PhysicalDeviceVulkan13Features,
 			vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain = { //for enabling each structs data while optionally enabling functionality controlled by feature switches
-				{}, //still gets basic functionality
+				{}, //no optional vulkan 1.0 features requested
 				{.shaderDrawParameters = true}, //using this feature from PhysicalDeviceVulkan11Features
 				{.dynamicRendering = true},
 				{.extendedDynamicState = true}
