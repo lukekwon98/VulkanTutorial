@@ -14,6 +14,7 @@ import vulkan_hpp; //if C++20 modules is enabled, we import this instead
 #include <stdexcept>
 #include <cstdlib> 
 #include <algorithm>
+#include <map>
 
 constexpr uint32_t WIDTH = 800; //calculates its value eduring compilation, speeds up runtime execution, unlike const for which initialization can still happen at runtime
 constexpr uint32_t HEIGHT = 600;
@@ -64,6 +65,11 @@ private:
 
 	vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr; //tell vulkan about the callback function, you can have as many as you want
 
+	vk::raii::PhysicalDevice physicalDevice = nullptr; //the graphics card that we'll select will be stored here
+
+	std::vector<const char*> requiredDeviceExtension = { vk::KHRSwapchainExtensionName };
+
+
 	void initWindow() {
 		//first call should be glfwInit() - initializes the GLFW library (it's originally designed to create an OpenGL context, so we need to tell it not to create an OpenGL context)
 		glfwInit();
@@ -78,6 +84,47 @@ private:
 	void initVulkan() {
 		createInstance(); //initializing the vulkan library by creating an instance - it is the connectino between the application and the vulkan library
 		setupDebugMessenger();
+		pickPhysicalDevice();
+	}
+
+	bool isDeviceSuitable(vk::raii::PhysicalDevice const& physicalDevice) {
+		bool supportsVulkan1_3 = physicalDevice.getProperties().apiVersion >= vk::ApiVersion13;
+
+		//almost every operation in vulkan, from drawing to uplaoding textures requires commands to be submitted to a queue
+		//there are different types of queues from different queue families, and each family of queues only allows a small subset of commands (some only allow compute commands and other only allow memory transfer commands)
+		auto queueFamilies = physicalDevice.getQueueFamilyProperties();
+		bool supportsGraphics = std::ranges::any_of(queueFamilies, [](auto const& qfp) {return !!(qfp.queueFlags & vk::QueueFlagBits::eGraphics); }); //looking for queues that support graphics commands
+
+		//required extension check (currently we're only using vk::KHRSwapchainExtensionName)
+		auto availableDeviceExtensions = physicalDevice.enumerateDeviceExtensionProperties();
+		bool supportsAllRequiredExtensions = 
+		std::ranges::all_of(requiredDeviceExtension,
+			[&availableDeviceExtensions](auto const& requiredDeviceExtension)
+			{
+				return std::ranges::any_of(availableDeviceExtensions,
+					[requiredDeviceExtension](auto const& availableDeviceExtension)
+					{ return strcmp(availableDeviceExtension.extensionName, requiredDeviceExtension) == 0; });
+			});
+
+		//required feature check
+		auto features = physicalDevice.template getFeatures2 <vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+		bool supportsrequiredFeatures = features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
+										features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
+										features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
+
+		return supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsrequiredFeatures;
+	}
+
+	//after initializing the Vulkan library, we need to look for and select a graphics card that supports the features we need, we can choose as many as we want
+	void pickPhysicalDevice() {
+		std::vector<vk::raii::PhysicalDevice> physicalDevices = instance.enumeratePhysicalDevices();
+
+		auto const devIter = std::ranges::find_if(physicalDevices, [&](auto const& physicalDevice) { return isDeviceSuitable(physicalDevice); });
+		if (devIter == physicalDevices.end()) {
+			throw std::runtime_error("failed to find a suitable GPU!");
+		}
+
+		physicalDevice = *devIter;
 	}
 
 	void setupDebugMessenger() {
