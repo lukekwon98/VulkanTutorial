@@ -114,6 +114,8 @@ private:
 
 	std::vector<vk::raii::ImageView> swapChainImageViews; //in order to use any image, we need to create a ImageView object: how to access the image and which part of the iamge to access
 
+	vk::raii::PipelineLayout pipelineLayout = nullptr;
+
 	void initWindow() {
 		//first call should be glfwInit() - initializes the GLFW library (it's originally designed to create an OpenGL context, so we need to tell it not to create an OpenGL context)
 		glfwInit();
@@ -165,6 +167,55 @@ private:
 		vk::PipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
 
 		//pSpecializationInfo allows you to specify values for shader constants - more efficient than configuring shader variables at render time because the compiler can do optimizations like eliminating if statements that depend on these values
+
+		//specifies bindings - spacing between data and whether it's per-vertex or per-instance / attribute descriptions - types of attributse passed ot the vertex sahder, and which binding to laod them from and at which offset
+		vk::PipelineVertexInputStateCreateInfo vertexInputInfo; //hard coding vertex data for now
+
+		//what kind of geometry will be drawn and if primitive restart should be enabled - with an element buffer we can specify the indicies ourselves, which allows for reusing vertices
+		vk::PipelineInputAssemblyStateCreateInfo inputAssembly{ .topology = vk::PrimitiveTopology::eTriangleList };
+
+		//viewports define the transformation from the image(NDC) to the framebuffer(pixel) - it covers the full swapchain image here
+		//size of the swap chain and it simages may diffeer from widht and height, but we should stick to their size as they'll be used as the color attachments of the framebuffer later on - 0.0 and 1.0 are mindepth, maxdepth (mindepth may be higher than maxdepth but just go with standard for now)
+		vk::Viewport viewport{ 0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f }; //describes the region of the framebuffer that the output will be rendered to, almost always be width, height
+
+		//scissors reject fragments before they write to the fraembuffer
+		vk::Rect2D scissor{ vk::Offset2D{0,0}, swapChainExtent };  //scissor rectangles define which region of pixels will actually be stored, rasterizer discards any pixels outside the scissored rectangles - like a filter than a transformation
+
+		//older APIs provided the default state (not stages of the pipeline, which pipeline 'settings' you can supply through commands at draw time instead of fixing them when creating the pipeline) for most of the stages of the graphics pipeline - in Vulkan, you have to be explicit about the pipeline states since they are baked into an immutable pipeline object
+		//a limited amount of state (size of the viewport, line width and blend constants) can be changed without recreating the pipeline at draw time
+		std::vector<vk::DynamicState> dynamicStates = { vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+		vk::PipelineDynamicStateCreateInfo dynamicState{ .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data() };
+
+		//specify the count at pipeline creation time - note that our specified viewport and scissor are not connected since we're using dynamic states for these
+		vk::PipelineViewportStateCreateInfo viewportState{ .viewportCount = 1, .scissorCount = 1 };
+
+		vk::PipelineRasterizationStateCreateInfo rasterizer{ .depthClampEnable = vk::False, //true -> fragments beyond th near and far planes are clamped instead of discarding (useful for shadow maps)
+															.rasterizerDiscardEnable = vk::False, //true -> geometry never passes through the rasterizer stage (disables any output to the framebuffer)
+															.polygonMode = vk::PolygonMode::eFill, //fill, wireframe, or points
+															.cullMode = vk::CullModeFlagBits::eBack, //disable, front, back, or both
+															.frontFace = vk::FrontFace::eClockwise, //specifies vertex order for the faces considered front-facing <-> counterclockwise
+															.depthBiasEnable = vk::False, //can alter depth values by adding a constant value or biasing them based on a fragment's slope, sometimes used for shadow mapping
+															.lineWidth = 1.0f }; //thickness of lines in terms of number of fragments
+
+
+		//multisampling - one of the ways to perform antialiasing (combines the fragment shader results to multiple polyogns that rasterize to the same pixel)
+		vk::PipelineMultisampleStateCreateInfo multisampling{ .rasterizationSamples = vk::SampleCountFlagBits::e1, .sampleShadingEnable = vk::False }; //doesn't need to run the fragment shader multiple times if only one polygon maps to a pixel - significantly less expensive than simply rendering to a higher res then downscaling
+
+		//no depth/stencil buffer for now
+
+		//colorBlending configuration per attached framebuffer 
+		vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+			.blendEnable = vk::False,
+			.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA };
+
+		//attachment count is color attachments - 1 deferred rendering framebuffer would have something like 3 color attachments (albedo normals worldpositions) and 1 depth attachment
+		vk::PipelineColorBlendStateCreateInfo colorBlending{ .logicOpEnable = vk::False, .logicOp = vk::LogicOp::eCopy, .attachmentCount = 1, .pAttachments = &colorBlendAttachment };  //global color blending settings - logicOpEnable should be true to enable bitwise blending, then bitwise operation is specified in the logicOp field, colorWriteMask is used to determine which channels will actually be affected
+		
+		//uniform values - must be specified in pipeline layout
+		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{ .setLayoutCount = 0, .pushConstantRangeCount = 0 }; //push constants - another way of passing dynamic values to shaders
+		pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
+
+
 	}
 
 	//viewType, format, subresourceRange are identical for each of the image views
