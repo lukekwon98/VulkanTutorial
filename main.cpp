@@ -20,6 +20,7 @@ import vulkan_hpp; //if C++20 modules is enabled, we import this instead
 #include <algorithm>
 #include <cstdint> //uint32_t
 #include <limits> //std::numeric_limits
+#include <fstream>
 
 constexpr uint32_t WIDTH = 800; //calculates its value eduring compilation, speeds up runtime execution, unlike const for which initialization can still happen at runtime
 constexpr uint32_t HEIGHT = 600;
@@ -30,6 +31,11 @@ constexpr uint32_t HEIGHT = 600;
 const std::vector<char const*> validationLayers = {
 	"VK_LAYER_KHRONOS_validation" //enabled by specifying name (this is a bundle of all the useful standard validation)
 };
+
+//Advantages of the ___info -> createObject(device, ___info) pattern
+//readable configuration: named fields are easier to understand than a long list of positional arguments
+//extensibility: many Vulkan structures support a pNext chain for additional feature or extension settings
+//explicit control: the driver receives the configuration together, allowing validation and object preparation at creation time
 
 #ifdef NDEBUG //not debug, c++ macro
 constexpr bool enableValidationLayers = false;
@@ -51,6 +57,25 @@ if (enableValidationLayers) {
 
 return extensions;
 }
+
+//we'll be reading the SPIR-V .spv instead of a text - shader
+static std::vector<char> readFile(const std::string& filename) {
+	std::ifstream file(filename, std::ios::ate | std::ios::binary); //start reading at the end of the file | read the file as a binary file (no text transformations)
+
+	if (!file.is_open()) {
+		throw std::runtime_error{ "failed to open file!" };
+	}
+
+	std::vector<char> buffer(file.tellg()); //since we're reading at the end, we can determine the size of the file
+
+	file.seekg(0, std::ios::beg); //seek to the beginning
+	file.read(buffer.data(), static_cast<std::streamsize>(buffer.size())); //read file by amoutn size
+
+	file.close();
+
+	return buffer;
+}
+
 
 class HelloTriangleApplication {
 public:
@@ -108,6 +133,38 @@ private:
 		createLogicalDevice();
 		createSwapChain();
 		createImageViews();
+		createGraphicsPipeline();
+	}
+	
+	//nodiscard asks the compiler to warn if you ignore a function's return value (calling a function without assigning return value to anything)
+	//must wrap the shader code in a shader module before passing it into the pipeline
+	[[nodiscard]]
+	vk::raii::ShaderModule createShaderModule(const std::vector<char>& code) {
+		//size of bytecode is in bytes, but the bytecoe pointer is a uint32_t (4 bytes). reinterpret_cast interprets a value as another type
+		vk::ShaderModuleCreateInfo createInfo{ .codeSize = code.size() * sizeof(char), .pCode = reinterpret_cast<const uint32_t*>(code.data()) }; //specify a pointer to the buffer with the bytecode and length
+		vk::raii::ShaderModule shaderModule{ device, createInfo };
+
+		//shader modules are just a thin wrapper around the shader bytecode that we've previously loaded, 
+		//compilation and linking of the SPIR-V bytecode to machine code doesn't happen until the graphics pipeline is created -> we're allowed to destroy the shader modules as soon as the pipeline creation is finished
+		return shaderModule;
+	}
+
+	//Vulkan shader code has to be specified in a bytecode format - SPIR-V, the compilers written by GPU vendors to turn shader code into native code are less complex, no risk of other GPU vendors misinterpreting shader code
+	//Khronos has their own vendor-independent compiler that compiles slang to SPIR-V (used via slangc)
+	//Slang is a C-style shading language
+	//Vulkan NDC has depth [0,1] and top y coord is -1, while bottom is 1
+	void createGraphicsPipeline() {
+		auto shaderCode = readFile("shaders/slang.spv");
+		vk::raii::ShaderModule shaderModule = createShaderModule(shaderCode); //shader modules can be destoryed as soon as the pipeline is created, which is why it's a local var
+
+		//1 -eVertex = stage we're working in, 2 - specifie sshadermodule containing the code 3 - specifies the function to invoke (entrypoint): possible to combine multiple fragment shaders inot a single shader module and use different entry points to differentiate between behaviors
+		vk::PipelineShaderStageCreateInfo vertShaderStageInfo{ .stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "vertMain" };
+
+		vk::PipelineShaderStageCreateInfo fragShaderStageInfo{ .stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "fragMain" };
+
+		vk::PipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
+
+		//pSpecializationInfo allows you to specify values for shader constants - more efficient than configuring shader variables at render time because the compiler can do optimizations like eliminating if statements that depend on these values
 	}
 
 	//viewType, format, subresourceRange are identical for each of the image views
