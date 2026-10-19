@@ -101,6 +101,7 @@ private:
 
 	vk::raii::Device device = nullptr; //logical device
 
+	//command buffer: contains recorded instructions, queue: receives the command buffers for execution
 	vk::raii::Queue queue = nullptr; //interface to handle queues which are automatically created along with the logical device, implicitly cleaned up when the device is destroyed
 
 	uint32_t queueIndex = ~0; //bitwise not, all bits are set to 1
@@ -126,6 +127,17 @@ private:
 
 	vk::raii::CommandBuffer commandBuffer = nullptr;
 
+	//Semaphores: used both to order work inside the same queue and between different queues - binary and timeline
+	//Binary sempahore: unsignaled or signaled (begins life as unsignaled) A executes -> A finishes -> S signals -> B starts -> S reset to unsignaled
+	// 
+	//Fences: similar in that it is used to synchronize executino, but it's for ordering the execution on the CPU (host) - when the CPU needs to know when the GPU has finished something
+	//same, unsignaled or signaled. must be reset manually because the host is controlling the host, it gets to decide
+	//it is prefarable to not block the host if possible
+
+	//Semaphores are for swapchain operations and fences are for waiting on the previous frame to finish (we can't record the next frame's work to the command buffer until the current frame has finished executing)
+	vk::raii::Semaphore presentCompleteSemaphore = nullptr;
+	vk::raii::Semaphore renderFinishedSempahore = nullptr;
+	vk::raii::Fence drawFence = nullptr;
 
 	void initWindow() {
 		//first call should be glfwInit() - initializes the GLFW library (it's originally designed to create an OpenGL context, so we need to tell it not to create an OpenGL context)
@@ -149,6 +161,13 @@ private:
 		createGraphicsPipeline();
 		createCommandPool();
 		createCommandBuffer();
+		createSyncObjects();
+	}
+
+	void createSyncObjects() {
+		presentCompleteSemaphore = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
+		renderFinishedSempahore = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
+		drawFence = vk::raii::Fence(device, { .flags = vk::FenceCreateFlagBits::eSignaled }); //create a fence already in a signaled state (cause host side has to work)
 	}
 
 	//before rendering to an image, we need to transition its layout to one that is suitable for rendering (some are optimized to be presented to the screen, others are optimized for being used as color attachments)
@@ -183,7 +202,7 @@ private:
 			.imageMemoryBarrierCount = 1,
 			.pImageMemoryBarriers = &barrier };
 
-		commandBuffer.pipelineBarrier2(dependency_info);
+		commandBuffer.pipelineBarrier2(dependency_info); //which earlier operations to wait for, which later operations depend on them, an image layout transition, when needed
 	}
 
 	void recordCommandBuffer(uint32_t imageIndex) {
@@ -240,7 +259,7 @@ private:
 			vk::PipelineStageFlagBits2::eBottomOfPipe //dstStage
 		);
 
-		commandBuffer.end();
+		commandBuffer.end(); //finish recording the command buffer
 	}
 
 	void createCommandBuffer() {
@@ -494,6 +513,7 @@ private:
 		//now we request a queue from that family when creating the logical device
 		std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
 		
+		//find appropriate queueIndex from queue that suffices all required flags
 		for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); qfpIndex++) {
 			if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) && physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface)) { //also must be surface compatible
 				queueIndex = qfpIndex;
@@ -519,7 +539,7 @@ private:
 			vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain = { //for enabling each structs data while optionally enabling functionality controlled by feature switches
 				{}, //no optional vulkan 1.0 features requested
 				{.shaderDrawParameters = true}, //using this feature from PhysicalDeviceVulkan11Features
-				{.dynamicRendering = true},
+				{.synchronization2 = true, .dynamicRendering = true}, //synchronization2 provides a newer API for specifying GPU synchronization, including pipeline barriers and memory dependencies (we use pipelinebarrier2 when transitioning image layouts)
 				{.extendedDynamicState = true}
 		};
 
@@ -560,7 +580,8 @@ private:
 		auto features = physicalDevice.template getFeatures2 <vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
 		bool supportsrequiredFeatures = features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
 										features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
-										features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
+										features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState &&
+										features.template get<vk::PhysicalDeviceVulkan13Features>().synchronization2;
 
 		return supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsrequiredFeatures;
 	}
@@ -605,7 +626,69 @@ private:
 	void mainLoop() {
 		while (!glfwWindowShouldClose(window)) { //checks for events like pressing the X button until the user has closed the window
 			glfwPollEvents();
+			drawFrame();
 		}
+
+		//all operations in drawFrame are asynchronous: when we exit the loop in mainLoop, drawing and presentation operations may still be going on - cleaning resources while that is happening is a bad idea
+		device.waitIdle(); //wait for the logical device to finish operations before exiting mainloop and destoring the window 
+	}
+
+	//steps of rendering a frame
+	//1. wait for the previous frame to finish
+	//2. acquire an image from the swap chain
+	//3. record a command buffer which draws the scene onto that image
+	//4. submit the recorded command buffer
+	//5. present the swap chain image
+	void drawFrame() {
+		//in Vulkan, synchronization of exeuction on the GPU is explicit, so by default many vulkan api calls that start executing work on the GPU are asynchronous
+		//Events that need to be ordered explicitly because they happen on the GPU
+		//1 acquire an image from the swap chain
+		//2 execute commands that draw onto the acquired image
+		//3 present that image to the screen for presentation, returning it to the swapchain
+
+		//at the start of the frame, we want to wait until the previous frame has finished, so that the command buffer and semaphores are available to use
+		auto fenceResult = device.waitForFences(*drawFence, vk::True, UINT64_MAX); //takes an array of fences and waits on the host for either any or all of the fences to be signaled before returning, true means we want to wait for all fences, timeout parameter is 64 unsigned, which basically disables timeout
+		if (fenceResult != vk::Result::eSuccess) {
+			throw std::runtime_error("failed to wait for fence!");
+		}
+		device.resetFences(*drawFence);
+		
+		//parameter 2: specifies synchronization objects that are to be signaled when the presentation engine is finished using the image, nullptr is a slot for a fence
+		//returns vk::Result, and index of the swap chain image that has become available
+		auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphore, nullptr); //timeout in nanoseconds for an image to become available, also effectively disabled
+		
+		//with the imageIndex specifies the swap chain image to use in hand, we can record the command buffer
+		recordCommandBuffer(imageIndex);
+
+		//now submit the recorded command buffer
+		//execute this command buffer, wait for image availability before color output, and signal when the work is finished
+		vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput); //waits before this starts
+		const vk::SubmitInfo submitInfo{ .waitSemaphoreCount = 1,
+										.pWaitSemaphores = &*presentCompleteSemaphore,
+										.pWaitDstStageMask = &waitDestinationStageMask, //first three specify which sempahores to wait on before execution begins and in which stages of the pipeline to wait (we're specifying the stage that writes to the color attachemtn, because we want to wait for writing colors to the image until it's available)
+										.commandBufferCount = 1, 
+										.pCommandBuffers = &*commandBuffer, //which command buffer to actually submit for execution (we only have 1 so we submit it)
+										.signalSemaphoreCount = 1,
+										.pSignalSemaphores = &*renderFinishedSempahore }; //specifies which sempahores to signal once the command buffers have finished execution
+
+		queue.submit(submitInfo, *drawFence); //takes in an array of submitInfos when the workload is much larger for efficiency, *drawFence is a reference to an optional fence that will be signaled when the command buffers finish execution
+	
+		//image stays in the swapchain the whole time. it isn't copied out and back in, what changes is who can use it:
+		//Acquire: obtain an image index and wait until that image is available
+		//Render: write directly into that swapchain image
+		//Present: tell the presentation system which image to display
+		//submitting the result back to the swap chain to have it eventually show up on the screen (it has to go in and out of the swapchain?)
+		const vk::PresentInfoKHR presentInfoKHR{
+			.waitSemaphoreCount = 1,
+			.pWaitSemaphores = &*renderFinishedSempahore, //specifies which semaphores to wait on before presentation can happen
+			.swapchainCount = 1,
+			.pSwapchains = &*swapChain, //the swap chains to presen tiamges to
+			.pImageIndices = &imageIndex //index of the image for each swap chain
+		};
+		//.pResults = allows you to specify an array of vk::Result values to check for every swap chain if presentation was successful - not necessary if you're using 1 swapchain
+
+		//submits the request to present an image to the swap chain
+		result = queue.presentKHR(presentInfoKHR); //currently alolws only one rendering submission in flight (due to fence) - number of swapchain images is separate from frames in flight
 	}
 
 	void cleanup() {
