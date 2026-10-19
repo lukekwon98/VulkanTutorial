@@ -116,6 +116,8 @@ private:
 
 	vk::raii::PipelineLayout pipelineLayout = nullptr;
 
+	vk::raii::Pipeline graphicsPipeline = nullptr;
+
 	void initWindow() {
 		//first call should be glfwInit() - initializes the GLFW library (it's originally designed to create an OpenGL context, so we need to tell it not to create an OpenGL context)
 		glfwInit();
@@ -159,7 +161,11 @@ private:
 		auto shaderCode = readFile("shaders/slang.spv");
 		vk::raii::ShaderModule shaderModule = createShaderModule(shaderCode); //shader modules can be destoryed as soon as the pipeline is created, which is why it's a local var
 
-		//1 -eVertex = stage we're working in, 2 - specifie sshadermodule containing the code 3 - specifies the function to invoke (entrypoint): possible to combine multiple fragment shaders inot a single shader module and use different entry points to differentiate between behaviors
+		///////////////////////////////
+		// Shader modules
+		///////////////////////////////
+
+		//1 - eVertex = stage we're working in, 2 - specifie sshadermodule containing the code 3 - specifies the function to invoke (entrypoint): possible to combine multiple fragment shaders inot a single shader module and use different entry points to differentiate between behaviors
 		vk::PipelineShaderStageCreateInfo vertShaderStageInfo{ .stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "vertMain" };
 
 		vk::PipelineShaderStageCreateInfo fragShaderStageInfo{ .stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "fragMain" };
@@ -171,10 +177,14 @@ private:
 		//specifies bindings - spacing between data and whether it's per-vertex or per-instance / attribute descriptions - types of attributse passed ot the vertex sahder, and which binding to laod them from and at which offset
 		vk::PipelineVertexInputStateCreateInfo vertexInputInfo; //hard coding vertex data for now
 
+		///////////////////////////////
+		// Fixed function setup (only configuring) - dynamic state, input assembly, viewports and scissors, rasterizer, multisampling, depth and stencil testing, colorblending, pipeline layout
+		///////////////////////////////
+
 		//what kind of geometry will be drawn and if primitive restart should be enabled - with an element buffer we can specify the indicies ourselves, which allows for reusing vertices
 		vk::PipelineInputAssemblyStateCreateInfo inputAssembly{ .topology = vk::PrimitiveTopology::eTriangleList };
 
-		//viewports define the transformation from the image(NDC) to the framebuffer(pixel) - it covers the full swapchain image here
+		//viewports define the transformation from the image(NDC) to the framebuffer 'coordinates'(pixel, coordiante space of the rendering destination) - we still need this if we're doing dynamic rendering, here it covers the full swapchain image
 		//size of the swap chain and it simages may diffeer from widht and height, but we should stick to their size as they'll be used as the color attachments of the framebuffer later on - 0.0 and 1.0 are mindepth, maxdepth (mindepth may be higher than maxdepth but just go with standard for now)
 		vk::Viewport viewport{ 0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f }; //describes the region of the framebuffer that the output will be rendered to, almost always be width, height
 
@@ -215,6 +225,34 @@ private:
 		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{ .setLayoutCount = 0, .pushConstantRangeCount = 0 }; //push constants - another way of passing dynamic values to shaders
 		pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
 
+		//graphics pipeline: how to draw: shaders, veretx input, rasterization, depth testing, blending etc
+		//vkRenderPass: the attachment setup and organization of rendering: attachment formats, load/store operations, subpasses, and their dependencies
+		//vkFramebuffer: the particular image views used as attachments with a compatible render pass
+
+		//before we had to tell Vulkan about the framebuffer attachments that would be used while rendering through a render pass object - since vulkan 1.3 we can bypass this and specify color, depth, and stencil attachments directly when being rendered
+		//to use dynamic rendering, we need to specify the formats of the attachments that will be used during rendering
+		vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{ .colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format }; //one color attachment, with the format o four swap chain images
+
+		//the actual pipeline: Shader stages + Fixed-function state + Pipeline layout + Dynamic rendering
+		vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
+			{.stageCount = 2,
+			.pStages = shaderStages,
+			.pVertexInputState = &vertexInputInfo, //pipelineshaderstagecreateinfo structs
+			.pInputAssemblyState = &inputAssembly,
+			.pViewportState = &viewportState,
+			.pRasterizationState = &rasterizer,
+			.pMultisampleState = &multisampling,
+			.pColorBlendState = &colorBlending,
+			.pDynamicState = &dynamicState,
+			.layout = pipelineLayout, //fixed function stage
+			.renderPass = nullptr }, //nullptr because we're using dynamci rendering instead of a traditional renderpass
+			{.colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format}
+		};
+		//basePipelineHandle, basePipelineIndex: vulkan allows you to create a new graphics pipeline by deriving from an existing pipeline - less expensive and switching can be done quicker
+
+		graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+		//nullptr = optional vk::raii::PipelineCache object - can be used to store adn resue data relevant to pipeline creation acrsos multiple calls to vk::raii::Pipeline constructors, significant speedup pipeline creation at a later time
+		
 
 	}
 
