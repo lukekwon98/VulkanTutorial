@@ -103,6 +103,8 @@ private:
 
 	vk::raii::Queue queue = nullptr; //interface to handle queues which are automatically created along with the logical device, implicitly cleaned up when the device is destroyed
 
+	uint32_t queueIndex = ~0; //bitwise not, all bits are set to 1
+
 	//needs to be created using HWND and HMODULE on windows
 	vk::raii::SurfaceKHR surface = nullptr; //connects Vulkan to the native window system, and GLFW helps create that connection. platform-independent handle to the window's presentation destination, GLFW handles the platform specifid work of creating the surface for our window
 
@@ -117,6 +119,13 @@ private:
 	vk::raii::PipelineLayout pipelineLayout = nullptr;
 
 	vk::raii::Pipeline graphicsPipeline = nullptr;
+	
+	//commands in Vulkan are not executed directly using function calls - you have to record all the operations you want to perform in command buffer objs: advantage - when we're ready to tell Vulkan what we want to do, the commands are submitted together (more efficient porcess of commands since all of them are available together + allows command recording to happen in multiple threads if desired)
+	//command pools - manage memory that is used to store the buffers, and command buffers are allocated from them
+	vk::raii::CommandPool commandPool = nullptr;
+
+	vk::raii::CommandBuffer commandBuffer = nullptr;
+
 
 	void initWindow() {
 		//first call should be glfwInit() - initializes the GLFW library (it's originally designed to create an OpenGL context, so we need to tell it not to create an OpenGL context)
@@ -138,6 +147,115 @@ private:
 		createSwapChain();
 		createImageViews();
 		createGraphicsPipeline();
+		createCommandPool();
+		createCommandBuffer();
+	}
+
+	//before rendering to an image, we need to transition its layout to one that is suitable for rendering (some are optimized to be presented to the screen, others are optimized for being used as color attachments)
+	void transition_image_layout(
+								uint32_t imageIndex,
+								vk::ImageLayout old_layout,
+								vk::ImageLayout new_layout,
+								vk::AccessFlags2 src_access_mask,
+								vk::AccessFlags2 dst_access_mask,
+								vk::PipelineStageFlags2 src_stage_mask,
+								vk::PipelineStageFlags2 dst_stage_mask) {
+		
+		vk::ImageMemoryBarrier2 barrier = {
+			.srcStageMask = src_stage_mask,
+			.srcAccessMask = src_access_mask,
+			.dstStageMask = dst_stage_mask,
+			.dstAccessMask = dst_access_mask,
+			.oldLayout = old_layout,
+			.newLayout = new_layout,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = swapChainImages[imageIndex],
+			.subresourceRange = {
+				   .aspectMask = vk::ImageAspectFlagBits::eColor,
+				   .baseMipLevel = 0,
+				   .levelCount = 1,
+				   .baseArrayLayer = 0,
+				   .layerCount = 1} };
+
+		vk::DependencyInfo dependency_info = {
+			.dependencyFlags = {},
+			.imageMemoryBarrierCount = 1,
+			.pImageMemoryBarriers = &barrier };
+
+		commandBuffer.pipelineBarrier2(dependency_info);
+	}
+
+	void recordCommandBuffer(uint32_t imageIndex) {
+		commandBuffer.begin({}); //start recording, we must always start with this
+
+		transition_image_layout(
+			imageIndex,
+			vk::ImageLayout::eUndefined, //old layout
+			vk::ImageLayout::eColorAttachmentOptimal,//transitioning image layout to this
+			{}, //srcAccessMask(no need to wait for previous operations)
+			vk::AccessFlagBits2::eColorAttachmentWrite, //dst AccessMask
+			vk::PipelineStageFlagBits2::eColorAttachmentOutput, //srcStage
+			vk::PipelineStageFlagBits2::eColorAttachmentOutput //dstStage
+		);
+
+		vk::ClearValue clearColor = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f);
+		vk::RenderingAttachmentInfo attachmentInfo = {
+			.imageView = swapChainImageViews[imageIndex], //which image view to render to
+			.imageLayout = vk::ImageLayout::eColorAttachmentOptimal, // specifies the layout of the image will be in during rendering
+			.loadOp = vk::AttachmentLoadOp::eClear, //what to do with th eimage before rendering
+			.storeOp = vk::AttachmentStoreOp::eStore, //what to do with the image after rendering
+			.clearValue = clearColor };
+
+		vk::RenderingInfo renderingInfo = {
+			.renderArea = {.offset = {0,0}, .extent = swapChainExtent}, //size fo the render area (similar to render area in a rener pass)
+			.layerCount = 1, //number of layers to render to (1 for non-layered image)
+			.colorAttachmentCount = 1,
+			.pColorAttachments = &attachmentInfo };
+
+		//start recording rendering session
+		commandBuffer.beginRendering(renderingInfo);
+
+		//eGraphics: specifies if graphics or compute pipeline
+		commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline); 
+
+		//we specified viewport and scissor state to be dynamic, so we have to set them in the command buffer before issuing the draw command
+		commandBuffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
+		commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
+
+		//vertexCount, instanceCount, firstVertex (offset into the vertex buffer - lowest value of SV_VertexId), firstInstance (offset for instanced rendering, lowest value of SV_InstanceID)
+		commandBuffer.draw(3, 1, 0, 0);
+
+		//end rendering command recording
+		commandBuffer.endRendering();
+
+		//after rendering, transition the swapchain image to vk::ImageLayout::ePresentSrcKHR so it can be presented to the screen
+		transition_image_layout(
+			imageIndex,
+			vk::ImageLayout::eColorAttachmentOptimal,
+			vk::ImageLayout::ePresentSrcKHR,
+			vk::AccessFlagBits2::eColorAttachmentWrite, //srcAccessMask
+			{}, //dstAccessMask
+			vk::PipelineStageFlagBits2::eColorAttachmentOutput, //srcStage
+			vk::PipelineStageFlagBits2::eBottomOfPipe //dstStage
+		);
+
+		commandBuffer.end();
+	}
+
+	void createCommandBuffer() {
+		vk::CommandBufferAllocateInfo allocInfo{ .commandPool = commandPool, 
+												.level = vk::CommandBufferLevel::ePrimary, //ePrimary: can be submitted to a queue for execution but cannot be called from other command buffers / eSecondary - cannot be submitted directly, but can be called from primary commandb uffers
+												.commandBufferCount = 1 };
+
+		commandBuffer = std::move(vk::raii::CommandBuffers(device, allocInfo).front()); //comandbuffer consturctor returns a commandBuffer vector, but we only want 1 so we're moving it out to a single variable
+	}
+
+	void createCommandPool() {
+		//eTransient - Hint that command buffers are rerecorded with new commands very often, eResetCommandBuffer - alolw command buffers to be rerecorded individually, or else they must all be reset together
+		vk::CommandPoolCreateInfo poolInfo{ .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer, .queueFamilyIndex = queueIndex };
+
+		commandPool = vk::raii::CommandPool(device, poolInfo);
 	}
 	
 	//nodiscard asks the compiler to warn if you ignore a function's return value (calling a function without assigning return value to anything)
@@ -191,11 +309,6 @@ private:
 		//scissors reject fragments before they write to the fraembuffer
 		vk::Rect2D scissor{ vk::Offset2D{0,0}, swapChainExtent };  //scissor rectangles define which region of pixels will actually be stored, rasterizer discards any pixels outside the scissored rectangles - like a filter than a transformation
 
-		//older APIs provided the default state (not stages of the pipeline, which pipeline 'settings' you can supply through commands at draw time instead of fixing them when creating the pipeline) for most of the stages of the graphics pipeline - in Vulkan, you have to be explicit about the pipeline states since they are baked into an immutable pipeline object
-		//a limited amount of state (size of the viewport, line width and blend constants) can be changed without recreating the pipeline at draw time
-		std::vector<vk::DynamicState> dynamicStates = { vk::DynamicState::eViewport, vk::DynamicState::eScissor };
-		vk::PipelineDynamicStateCreateInfo dynamicState{ .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data() };
-
 		//specify the count at pipeline creation time - note that our specified viewport and scissor are not connected since we're using dynamic states for these
 		vk::PipelineViewportStateCreateInfo viewportState{ .viewportCount = 1, .scissorCount = 1 };
 
@@ -229,7 +342,17 @@ private:
 		//vkRenderPass: the attachment setup and organization of rendering: attachment formats, load/store operations, subpasses, and their dependencies
 		//vkFramebuffer: the particular image views used as attachments with a compatible render pass
 
-		//before we had to tell Vulkan about the framebuffer attachments that would be used while rendering through a render pass object - since vulkan 1.3 we can bypass this and specify color, depth, and stencil attachments directly when being rendered
+		///////////////////////////////
+		// Dynamic Rendering
+		///////////////////////////////
+
+		//older APIs provided the default state (not stages of the pipeline, which pipeline 'settings' you can supply through commands at draw time instead of fixing them when creating the pipeline) for most of the stages of the graphics pipeline - in Vulkan, you have to be explicit about the pipeline states since they are baked into an immutable pipeline object
+		//a limited amount of state (size of the viewport, line width and blend constants) can be changed without recreating the pipeline at draw time
+		std::vector<vk::DynamicState> dynamicStates = { vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+		vk::PipelineDynamicStateCreateInfo dynamicState{ .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data() };
+
+		//dynamic rendering advantages - simplified code with fewer objects to manage - more flexibility in changing attachments during rendering - better compatibility with modern rendering techniques
+		//before we had to create framebuffers to bind our image views to a render pass - since vulkan 1.3 we can bypass this and render directly to image views (specify color, depth, and stencil attachments directly when being rendered)
 		//to use dynamic rendering, we need to specify the formats of the attachments that will be used during rendering
 		vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{ .colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format }; //one color attachment, with the format o four swap chain images
 
@@ -250,10 +373,7 @@ private:
 		};
 		//basePipelineHandle, basePipelineIndex: vulkan allows you to create a new graphics pipeline by deriving from an existing pipeline - less expensive and switching can be done quicker
 
-		graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
-		//nullptr = optional vk::raii::PipelineCache object - can be used to store adn resue data relevant to pipeline creation acrsos multiple calls to vk::raii::Pipeline constructors, significant speedup pipeline creation at a later time
-		
-
+		graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>()); //nullptr = optional vk::raii::PipelineCache object - can be used to store and resue data relevant to pipeline creation acrsos multiple calls to vk::raii::Pipeline constructors, significant speedup pipeline creation at a later time		
 	}
 
 	//viewType, format, subresourceRange are identical for each of the image views
@@ -374,7 +494,6 @@ private:
 		//now we request a queue from that family when creating the logical device
 		std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
 		
-		uint32_t queueIndex = ~0; //bitwise not, all bits are set to 1
 		for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); qfpIndex++) {
 			if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) && physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface)) { //also must be surface compatible
 				queueIndex = qfpIndex;
