@@ -671,6 +671,8 @@ private:
 										.signalSemaphoreCount = 1,
 										.pSignalSemaphores = &*renderFinishedSempahore }; //specifies which sempahores to signal once the command buffers have finished execution
 
+		//both renderFinishedSempahore and drawFence are signaled after the submitted work finishes
+		//not ethat queue.submit() returns after submitting the work, not after the submitted work finishes
 		queue.submit(submitInfo, *drawFence); //takes in an array of submitInfos when the workload is much larger for efficiency, *drawFence is a reference to an optional fence that will be signaled when the command buffers finish execution
 	
 		//image stays in the swapchain the whole time. it isn't copied out and back in, what changes is who can use it:
